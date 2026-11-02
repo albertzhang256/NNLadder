@@ -1,6 +1,6 @@
-# CIFAR-10 Classification with Basic CNN
+# CIFAR-10 Classification with ResNet-14
 
-This directory contains PyTorch code for training and evaluating a basic Convolutional Neural Network (CNN) on the CIFAR-10 dataset.
+This directory contains PyTorch code for training and evaluating a 14-layer Residual Network (ResNet-14) tailored for the CIFAR-10 dataset.
 
 ## Dataset Storage
 By default, the dataset is automatically downloaded and stored in:
@@ -10,11 +10,13 @@ By default, the dataset is automatically downloaded and stored in:
 This is configured via the `--data-dir` argument in `train.py`.
 
 ## Model Architecture (`model.py`)
-`BasicCNN` is a 3-block convolutional neural network designed for CIFAR-10:
-- **Block 1**: 2x Conv2d (32 channels, 3x3) + BatchNorm2d + ReLU + MaxPool2d (2x2) + Dropout (0.25)
-- **Block 2**: 2x Conv2d (64 channels, 3x3) + BatchNorm2d + ReLU + MaxPool2d (2x2) + Dropout (0.25)
-- **Block 3**: Conv2d (128 channels, 3x3) + BatchNorm2d + ReLU + MaxPool2d (2x2) + Dropout (0.25)
-- **Classifier**: Flatten + Linear (2048 -> 512) + BatchNorm1d + ReLU + Dropout (0.5) + Linear (512 -> 10)
+`ResNet14` is a 14-layer residual neural network designed specifically for $32\times 32$ CIFAR-10 images:
+- **Input / Stem**: 1x Conv2d (32 channels, 3x3) + BatchNorm2d + ReLU
+- **Stage 1 (32x32)**: 2 Residual Blocks (32 channels, 4 Conv layers)
+- **Stage 2 (16x16)**: 2 Residual Blocks (64 channels, 4 Conv layers, stride 2 downsampling)
+- **Stage 3 (8x8)**: 2 Residual Blocks (128 channels, 4 Conv layers, stride 2 downsampling)
+- **Classifier**: AdaptiveAvgPool2d (1x1) + Flatten + Linear (128 -> 10)
+- **Total weighted layers**: 13 Conv + 1 Linear = 14 layers (~697k trainable parameters)
 
 ## Requirements
 - Python 3.10+
@@ -42,6 +44,6 @@ python train.py
 - `--lr`: Learning rate for Adam optimizer (default: `0.001`).
 - `--weight-decay`: Weight decay for L2 regularization (default: `1e-4`).
 - `--seed`: Random seed for reproducibility (default: `42`).
-- `--save-path`: File path to save the best model weights (default: `cifar10_basic_cnn.pth`).
+- `--save-path`: File path to save the best model weights (default: `cifar10_resnet14.pth`).
 - `--num-workers`: DataLoader workers (default: `2`).
 - `--no-cuda`: Disable GPU training and force CPU.

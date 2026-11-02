@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
 
-from model import BasicCNN
+from model import ResNet14
 
 
 CIFAR10_CLASSES = (
@@ -225,7 +225,7 @@ def main():
     parser.add_argument(
         "--save-path",
         type=str,
-        default="cifar10_basic_cnn.pth",
+        default="cifar10_resnet14.pth",
         help="File path to save the best model weights",
     )
     parser.add_argument(
@@ -261,9 +261,9 @@ def main():
     )
 
     # Build model, criterion, optimizer, and scheduler
-    model = BasicCNN(num_classes=10).to(device)
+    model = ResNet14(num_classes=10).to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[Model] BasicCNN initialized with {total_params:,} trainable parameters.")
+    print(f"[Model] ResNet14 initialized with {total_params:,} trainable parameters.")
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(
