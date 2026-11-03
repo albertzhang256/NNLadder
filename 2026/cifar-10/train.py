@@ -34,7 +34,8 @@ def set_seed(seed: int = 42) -> None:
 def get_data_loaders(
     data_dir: str,
     batch_size: int,
-    num_workers: int = 2
+    num_workers: int = 2,
+    use_trivial_augment: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Download (if necessary) and load CIFAR-10 training and test datasets.
@@ -51,13 +52,19 @@ def get_data_loaders(
     cifar10_mean = (0.4914, 0.4822, 0.4465)
     cifar10_std = (0.2470, 0.2435, 0.2616)
 
-    # Standard data augmentation and normalization for training
-    train_transform = transforms.Compose([
+    # Data augmentation and normalization for training
+    train_transform_list = [
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
+    ]
+    if use_trivial_augment:
+        print("[Data] Using TrivialAugmentWide data augmentation.")
+        train_transform_list.append(transforms.TrivialAugmentWide())
+    train_transform_list.extend([
         transforms.ToTensor(),
         transforms.Normalize(cifar10_mean, cifar10_std),
     ])
+    train_transform = transforms.Compose(train_transform_list)
 
     # Normalization only for test evaluation
     test_transform = transforms.Compose([
@@ -240,6 +247,12 @@ def main():
         default=False,
         help="Disables CUDA training even if GPU is available",
     )
+    parser.add_argument(
+        "--no-trivial-augment",
+        action="store_true",
+        default=False,
+        help="Disables TrivialAugmentWide data augmentation",
+    )
 
     args = parser.parse_args()
 
@@ -258,6 +271,7 @@ def main():
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        use_trivial_augment=not args.no_trivial_augment,
     )
 
     # Build model, criterion, optimizer, and scheduler

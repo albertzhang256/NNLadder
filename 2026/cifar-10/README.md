@@ -47,3 +47,4 @@ python train.py
 - `--save-path`: File path to save the best model weights (default: `cifar10_resnet14.pth`).
 - `--num-workers`: DataLoader workers (default: `2`).
 - `--no-cuda`: Disable GPU training and force CPU.
+- `--no-trivial-augment`: Disables TrivialAugmentWide data augmentation (enabled by default).
