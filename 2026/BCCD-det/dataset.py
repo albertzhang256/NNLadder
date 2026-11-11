@@ -4,6 +4,12 @@ BCCD Dataset Loader for Blood Cell Count and Detection.
 This module loads microscopic blood smear images and their Supervisely JSON annotations
 for train, val, and test splits from /home/albert/data/bccd.
 
+Includes box-synchronized Data Augmentation (for training split):
+- Random Horizontal Flip
+- Random Vertical Flip
+- Random 90-degree Rotations (0, 90, 180, 270)
+- Color Jitter (brightness, contrast, saturation, subtle hue)
+
 Supported classes:
 - RBC (Red Blood Cells) -> index 0
 - WBC (White Blood Cells) -> index 1
@@ -12,6 +18,7 @@ Supported classes:
 
 import json
 import os
+import random
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -19,6 +26,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 
 # Standard BCCD class mapping
 CLASS_NAMES = ["RBC", "WBC", "Platelets"]
@@ -44,6 +52,71 @@ def get_default_transform(img_size: int = 448) -> T.Compose:
     ])
 
 
+class DetectionAugmentation:
+    """
+    Box-synchronized data augmentation for microscopic blood smear object detection.
+    All geometric transformations update both the PIL Image and normalized [x1, y1, x2, y2] boxes.
+
+    Args:
+        hflip_prob: Probability of horizontal flip (default: 0.5).
+        vflip_prob: Probability of vertical flip (default: 0.5).
+        rotate_90: Whether to apply random 0/90/180/270-degree rotations (default: True).
+        color_jitter_prob: Probability of applying color jitter (default: 0.8).
+    """
+
+    def __init__(
+        self,
+        hflip_prob: float = 0.5,
+        vflip_prob: float = 0.5,
+        rotate_90: bool = True,
+        color_jitter_prob: float = 0.8,
+    ):
+        self.hflip_prob = hflip_prob
+        self.vflip_prob = vflip_prob
+        self.rotate_90 = rotate_90
+        self.color_jitter_prob = color_jitter_prob
+        self.color_jitter = T.ColorJitter(
+            brightness=0.2,
+            contrast=0.2,
+            saturation=0.2,
+            hue=0.04,  # Subtle hue shift to preserve stain color semantics
+        )
+
+    def __call__(
+        self, img: Image.Image, boxes_xyxy: List[List[float]]
+    ) -> Tuple[Image.Image, List[List[float]]]:
+        boxes = [list(b) for b in boxes_xyxy]
+
+        # 1. Random Horizontal Flip
+        if random.random() < self.hflip_prob:
+            img = TF.hflip(img)
+            boxes = [[1.0 - x2, y1, 1.0 - x1, y2] for x1, y1, x2, y2 in boxes]
+
+        # 2. Random Vertical Flip
+        if random.random() < self.vflip_prob:
+            img = TF.vflip(img)
+            boxes = [[x1, 1.0 - y2, x2, 1.0 - y1] for x1, y1, x2, y2 in boxes]
+
+        # 3. Random 90-degree Rotation (dihedral symmetry for blood smears)
+        if self.rotate_90:
+            k = random.randint(0, 3)
+            if k == 1:
+                img = img.transpose(Image.Transpose.ROTATE_90)
+                boxes = [[y1, 1.0 - x2, y2, 1.0 - x1] for x1, y1, x2, y2 in boxes]
+            elif k == 2:
+                img = img.transpose(Image.Transpose.ROTATE_180)
+                boxes = [[1.0 - x2, 1.0 - y2, 1.0 - x1, 1.0 - y1] for x1, y1, x2, y2 in boxes]
+            elif k == 3:
+                img = img.transpose(Image.Transpose.ROTATE_270)
+                boxes = [[1.0 - y2, x1, 1.0 - y1, x2] for x1, y1, x2, y2 in boxes]
+
+        # 4. Photometric Color Jitter (does not affect box geometry)
+        if random.random() < self.color_jitter_prob:
+            img = self.color_jitter(img)
+
+        return img, boxes
+
+
 class BCCDDataset(Dataset):
     """
     PyTorch Dataset for BCCD blood cell detection.
@@ -53,6 +126,7 @@ class BCCDDataset(Dataset):
         split: 'train', 'val', or 'test'.
         img_size: Target square image dimension (e.g., 448 or 416).
         transform: Optional custom torchvision transform. If None, uses default.
+        augment: Whether to apply box-synchronized data augmentation (use True only for train).
     """
 
     def __init__(
@@ -61,12 +135,15 @@ class BCCDDataset(Dataset):
         split: str = "train",
         img_size: int = 448,
         transform: Optional[Callable] = None,
+        augment: bool = False,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.split = split
         self.img_size = img_size
         self.transform = transform if transform is not None else get_default_transform(img_size)
+        self.augment = augment
+        self.augmentation = DetectionAugmentation() if augment else None
 
         self.img_dir = self.data_dir / split / "img"
         self.ann_dir = self.data_dir / split / "ann"
@@ -105,9 +182,8 @@ class BCCDDataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         orig_w, orig_h = img.size
 
-        # 2. Parse JSON annotation
+        # 2. Parse JSON annotation into normalized [x1, y1, x2, y2]
         boxes_xyxy_norm = []
-        boxes_xywh_norm = []
         labels = []
 
         if ann_path.is_file():
@@ -141,20 +217,28 @@ class BCCDDataset(Dataset):
                 x2_norm = xmax / orig_w
                 y2_norm = ymax / orig_h
 
-                # Calculate normalized YOLO format [cx, cy, w, h] in [0, 1]
-                cx_norm = (x1_norm + x2_norm) / 2.0
-                cy_norm = (y1_norm + y2_norm) / 2.0
-                w_norm = x2_norm - x1_norm
-                h_norm = y2_norm - y1_norm
-
                 boxes_xyxy_norm.append([x1_norm, y1_norm, x2_norm, y2_norm])
-                boxes_xywh_norm.append([cx_norm, cy_norm, w_norm, h_norm])
                 labels.append(CLASS_TO_IDX[class_title])
 
-        # 3. Apply transformations to image
+        # 3. Apply synchronized Data Augmentation (if enabled for training)
+        if self.augmentation is not None:
+            img, boxes_xyxy_norm = self.augmentation(img, boxes_xyxy_norm)
+
+        # 4. Compute normalized YOLO format [cx, cy, w, h] from augmented [x1, y1, x2, y2]
+        boxes_xywh_norm = [
+            [
+                (x1 + x2) / 2.0,
+                (y1 + y2) / 2.0,
+                x2 - x1,
+                y2 - y1,
+            ]
+            for x1, y1, x2, y2 in boxes_xyxy_norm
+        ]
+
+        # 5. Apply resize & normalization transformations to image
         img_tensor = self.transform(img)
 
-        # 4. Convert targets to tensors (handle edge case of zero objects)
+        # 6. Convert targets to tensors (handle edge case of zero objects)
         if len(boxes_xyxy_norm) > 0:
             boxes_tensor = torch.tensor(boxes_xyxy_norm, dtype=torch.float32)
             boxes_xywh_tensor = torch.tensor(boxes_xywh_norm, dtype=torch.float32)
@@ -192,16 +276,18 @@ def get_dataloaders(
     batch_size: int = 8,
     img_size: int = 448,
     num_workers: int = 2,
+    augment: bool = True,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Builds training, validation, and test DataLoaders for BCCD.
+    Data augmentation is applied ONLY to the training split when augment=True.
     
     Returns:
         (train_loader, val_loader, test_loader)
     """
-    train_dataset = BCCDDataset(data_dir=data_dir, split="train", img_size=img_size)
-    val_dataset = BCCDDataset(data_dir=data_dir, split="val", img_size=img_size)
-    test_dataset = BCCDDataset(data_dir=data_dir, split="test", img_size=img_size)
+    train_dataset = BCCDDataset(data_dir=data_dir, split="train", img_size=img_size, augment=augment)
+    val_dataset = BCCDDataset(data_dir=data_dir, split="val", img_size=img_size, augment=False)
+    test_dataset = BCCDDataset(data_dir=data_dir, split="test", img_size=img_size, augment=False)
 
     train_loader = DataLoader(
         train_dataset,
@@ -234,17 +320,18 @@ def get_dataloaders(
 
 
 if __name__ == "__main__":
-    print("=== Testing BCCD Dataset and DataLoaders ===")
+    print("=== Testing BCCD Dataset, Augmentation, and DataLoaders ===")
     train_loader, val_loader, test_loader = get_dataloaders(
         data_dir="/home/albert/data/bccd",
         batch_size=4,
         img_size=448,
         num_workers=0,  # 0 for single-thread debug inspection
+        augment=True,
     )
 
-    print(f"Train batches: {len(train_loader)} (total images: {len(train_loader.dataset)})")
-    print(f"Val batches:   {len(val_loader)} (total images: {len(val_loader.dataset)})")
-    print(f"Test batches:  {len(test_loader)} (total images: {len(test_loader.dataset)})")
+    print(f"Train batches: {len(train_loader)} (total images: {len(train_loader.dataset)}, augment={train_loader.dataset.augment})")
+    print(f"Val batches:   {len(val_loader)} (total images: {len(val_loader.dataset)}, augment={val_loader.dataset.augment})")
+    print(f"Test batches:  {len(test_loader)} (total images: {len(test_loader.dataset)}, augment={test_loader.dataset.augment})")
 
     # Fetch one sample batch from training split
     sample_images, sample_targets = next(iter(train_loader))
@@ -260,4 +347,3 @@ if __name__ == "__main__":
             f"  Image {i} ({tgt['image_name']}): {num_boxes} boxes, "
             f"classes: {label_summary}, orig size: {tgt['orig_size'].tolist()}"
         )
-
