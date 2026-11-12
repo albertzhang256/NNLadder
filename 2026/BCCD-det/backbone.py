@@ -61,28 +61,53 @@ class ResNet18Backbone(nn.Module):
         self.out_channels = 512
         self.downsample_ratio = 32
         self.pretrained = pretrained
+        self.freeze_stages = 0
 
         # Optional parameter freezing
-        self._freeze_stages(freeze_stages)
+        self.set_freeze_stages(freeze_stages)
 
-    def _freeze_stages(self, freeze_stages: int):
-        """Freezes gradients for early feature extraction stages."""
-        if freeze_stages >= 1:
-            for p in self.conv1.parameters():
-                p.requires_grad = False
-            for p in self.bn1.parameters():
-                p.requires_grad = False
-            for p in self.layer1.parameters():
-                p.requires_grad = False
-        if freeze_stages >= 2:
-            for p in self.layer2.parameters():
-                p.requires_grad = False
-        if freeze_stages >= 3:
-            for p in self.layer3.parameters():
-                p.requires_grad = False
-        if freeze_stages >= 4:
-            for p in self.layer4.parameters():
-                p.requires_grad = False
+    def _stage_modules(self) -> List[List[nn.Module]]:
+        """Returns ordered list of module groups corresponding to stages 1..4."""
+        return [
+            [self.conv1, self.bn1, self.layer1],
+            [self.layer2],
+            [self.layer3],
+            [self.layer4],
+        ]
+
+    def set_freeze_stages(self, freeze_stages: int) -> None:
+        """
+        Freezes stages 1..freeze_stages and unfreezes any remaining stages.
+        Frozen BatchNorm layers are kept in eval mode so running stats do not drift.
+        """
+        if not 0 <= freeze_stages <= 4:
+            raise ValueError(f"freeze_stages must be between 0 and 4, got {freeze_stages}")
+
+        self.freeze_stages = freeze_stages
+
+        # Reset all parameters to trainable first so dynamic unfreezing works
+        for p in self.parameters():
+            p.requires_grad = True
+
+        for stage_idx, modules in enumerate(self._stage_modules(), start=1):
+            is_frozen = freeze_stages >= stage_idx
+            for mod in modules:
+                for p in mod.parameters():
+                    p.requires_grad = not is_frozen
+                if is_frozen:
+                    mod.eval()
+                elif self.training:
+                    mod.train()
+
+    def train(self, mode: bool = True):
+        """Sets training mode while keeping frozen backbone stages in eval mode."""
+        super().train(mode)
+        if mode and self.freeze_stages > 0:
+            for stage_idx, modules in enumerate(self._stage_modules(), start=1):
+                if self.freeze_stages >= stage_idx:
+                    for mod in modules:
+                        mod.eval()
+        return self
 
     def forward(
         self, x: torch.Tensor, return_stages: bool = False

@@ -78,7 +78,7 @@ def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
 # 2. Non-Maximum Suppression (NMS) Algorithms
 # ==============================================================================
 
-def py_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.45) -> torch.Tensor:
+def py_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.30) -> torch.Tensor:
     """
     Pure PyTorch single-class Non-Maximum Suppression (for learning and debugging).
 
@@ -118,8 +118,8 @@ def py_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.4
 
 def non_max_suppression(
     decoded_preds: Dict[str, torch.Tensor],
-    conf_threshold: float = 0.25,
-    iou_threshold: float = 0.45,
+    conf_threshold: float = 0.50,
+    iou_threshold: float = 0.30,
     max_detections: int = 100,
 ) -> List[torch.Tensor]:
     """
@@ -319,8 +319,8 @@ class YOLOHead(nn.Module):
     def decode_and_nms(
         self,
         predictions: torch.Tensor,
-        conf_threshold: float = 0.25,
-        iou_threshold: float = 0.45,
+        conf_threshold: float = 0.50,
+        iou_threshold: float = 0.30,
         max_detections: int = 100,
     ) -> List[torch.Tensor]:
         """Decodes raw predictions and applies Non-Maximum Suppression."""
@@ -335,8 +335,8 @@ class YOLOHead(nn.Module):
     def predict(
         self,
         features: torch.Tensor,
-        conf_threshold: float = 0.25,
-        iou_threshold: float = 0.45,
+        conf_threshold: float = 0.50,
+        iou_threshold: float = 0.30,
         max_detections: int = 100,
     ) -> List[torch.Tensor]:
         """Forward pass, decode, and apply NMS directly from backbone features."""
@@ -385,6 +385,10 @@ class BCCDYOLO(nn.Module):
         self.num_boxes = num_boxes
         self.out_channels = self.head.out_channels
 
+    def set_freeze_stages(self, freeze_stages: int) -> None:
+        """Dynamically updates which early ResNet-18 backbone stages are frozen (0 to 4)."""
+        self.backbone.set_freeze_stages(freeze_stages)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through backbone and detection head returning raw predictions."""
         features = self.backbone(x)
@@ -397,8 +401,8 @@ class BCCDYOLO(nn.Module):
     def predict(
         self,
         images: torch.Tensor,
-        conf_threshold: float = 0.25,
-        iou_threshold: float = 0.45,
+        conf_threshold: float = 0.50,
+        iou_threshold: float = 0.30,
         max_detections: int = 100,
     ) -> List[torch.Tensor]:
         """

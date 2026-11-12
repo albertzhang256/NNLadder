@@ -114,8 +114,8 @@ def run_inference_on_image(
     model: BCCDYOLO,
     image_path: Path,
     device: torch.device,
-    conf_threshold: float = 0.25,
-    iou_threshold: float = 0.45,
+    conf_threshold: float = 0.50,
+    iou_threshold: float = 0.30,
     img_size: int = 448,
 ) -> Tuple[Image.Image, List[Dict]]:
     """
@@ -322,14 +322,14 @@ def main():
     parser.add_argument(
         "--conf-threshold",
         type=float,
-        default=0.25,
-        help="NMS confidence score cutoff (default: 0.25)",
+        default=0.50,
+        help="NMS confidence score cutoff (default: 0.50)",
     )
     parser.add_argument(
         "--iou-threshold",
         type=float,
-        default=0.45,
-        help="NMS IoU suppression threshold (default: 0.45)",
+        default=0.30,
+        help="NMS IoU suppression threshold (default: 0.30)",
     )
     parser.add_argument(
         "--save-path",

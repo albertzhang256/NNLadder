@@ -2,20 +2,23 @@
 Overarching Training, Validation, and Testing Script for BCCD YOLO Detector.
 
 This script manages:
-1. YOLOLoss: Loss function combining coordinate regression (MSE), objectness
-   confidence (BCEWithLogits), background confidence (no-object BCEWithLogits),
-   and cell classification (CrossEntropy).
+1. YOLOLoss: Loss function combining CIoU box regression, dynamic IoU-based
+   box responsibility matching, IoU-aware objectness confidence (BCEWithLogits),
+   background confidence (no-object BCEWithLogits), and cell classification.
 2. train_one_epoch: Training step with gradient clipping and loss component logging.
 3. validate: Evaluation step on the validation set.
 4. test_model: Final evaluation on the test set with NMS predictions.
 5. Model checkpointing: Saves 'best_model.pth' and 'last_model.pth'.
 
 Usage:
-    # Full training for 20 epochs
+    # Two-stage training with differential LRs & selective early freezing (default)
     python train.py --epochs 20 --batch-size 8
 
-    # Quick dry run (1 epoch)
-    python train.py --epochs 1 --batch-size 4
+    # Full end-to-end unfreezing in Stage 2
+    python train.py --epochs 20 --warmup-epochs 5 --freeze-stages 0
+
+    # Manual Stage 2 resume from Stage 1 checkpoint
+    python train.py --resume checkpoints/last_model.pth --freeze-stages 0 --epochs 15
 
     # Run test evaluation only using existing weights
     python train.py --test-only --weights checkpoints/best_model.pth
@@ -30,10 +33,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.ops as ops
 from torch.utils.data import DataLoader
 
 from dataset import CLASS_NAMES, get_dataloaders
-from yolo_head import BCCDYOLO, build_bccd_yolo
+from yolo_head import BCCDYOLO, box_iou, build_bccd_yolo
 
 
 # ==============================================================================
@@ -45,18 +49,20 @@ class YOLOLoss(nn.Module):
     Computes YOLO detection loss against ground-truth bounding boxes.
 
     Loss components:
-    1. Coordinate loss (MSE on center offsets and square-root box dimensions)
-    2. Objectness confidence loss (BCEWithLogits for responsible box)
-    3. No-object confidence loss (BCEWithLogits for empty background boxes)
+    1. Coordinate loss (Complete IoU / CIoU loss on IoU-matched boxes)
+    2. Objectness confidence loss (IoU-aware BCEWithLogits for responsible box)
+    3. No-object confidence loss (BCEWithLogits for competing & background boxes)
     4. Classification loss (CrossEntropy for grid cells containing objects)
 
     Args:
         num_classes: Number of object classes (3 for BCCD).
         num_boxes: Number of predicted boxes per grid cell (default: 2).
-        lambda_coord: Weight for bounding box coordinate loss (default: 5.0).
-        lambda_noobj: Weight for background / no-object confidence loss (default: 2.0).
+        lambda_coord: Weight for bounding box CIoU loss (default: 5.0).
+        lambda_noobj: Weight for background / no-object confidence loss (default: 5.0).
         lambda_obj: Weight for foreground objectness confidence loss (default: 1.0).
         lambda_class: Weight for classification loss (default: 1.0).
+        iou_target_weight: Blend weight alpha in [0, 1] for IoU-aware objectness
+            targets: target_conf = (1 - alpha) + alpha * IoU (default: 0.5).
     """
 
     def __init__(
@@ -64,9 +70,10 @@ class YOLOLoss(nn.Module):
         num_classes: int = 3,
         num_boxes: int = 2,
         lambda_coord: float = 5.0,
-        lambda_noobj: float = 2.0,
+        lambda_noobj: float = 5.0,
         lambda_obj: float = 1.0,
         lambda_class: float = 1.0,
+        iou_target_weight: float = 0.5,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -75,6 +82,7 @@ class YOLOLoss(nn.Module):
         self.lambda_noobj = lambda_noobj
         self.lambda_obj = lambda_obj
         self.lambda_class = lambda_class
+        self.iou_target_weight = iou_target_weight
 
     def forward(
         self,
@@ -97,50 +105,18 @@ class YOLOLoss(nn.Module):
         S = grid_h
 
         # ------------------------------------------------------------------
-        # A. Build Ground-Truth Target Tensors
+        # A. Decode Model Predictions to Normalized [x1, y1, x2, y2] Boxes
         # ------------------------------------------------------------------
-        target_coord = torch.zeros(batch_size, S, S, self.num_boxes, 4, device=device)
-        target_conf = torch.zeros(batch_size, S, S, self.num_boxes, device=device)
-        obj_mask = torch.zeros(batch_size, S, S, self.num_boxes, dtype=torch.bool, device=device)
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(grid_h, device=device, dtype=predictions.dtype),
+            torch.arange(grid_w, device=device, dtype=predictions.dtype),
+            indexing="ij",
+        )
+        grid_x = grid_x.unsqueeze(0)  # (1, S, S)
+        grid_y = grid_y.unsqueeze(0)  # (1, S, S)
 
-        target_class = torch.zeros(batch_size, S, S, dtype=torch.int64, device=device)
-        class_mask = torch.zeros(batch_size, S, S, dtype=torch.bool, device=device)
-
-        for b in range(batch_size):
-            gt_boxes = targets[b]["boxes_xywh"]  # [N, 4]: cx, cy, w, h in [0, 1]
-            gt_labels = targets[b]["labels"]     # [N]
-
-            for idx in range(len(gt_boxes)):
-                cx, cy, w, h = gt_boxes[idx].tolist()
-                label = gt_labels[idx].item()
-
-                # Determine which grid cell (gy, gx) contains the center of the cell
-                gx = min(int(cx * S), S - 1)
-                gy = min(int(cy * S), S - 1)
-
-                # Local offset within grid cell [0.0, 1.0]
-                tx = cx * S - gx
-                ty = cy * S - gy
-
-                # Assign to Box 0 or Box 1 in this cell
-                box_idx = 0
-                if obj_mask[b, gy, gx, 0]:
-                    box_idx = 1  # If Box 0 already claimed, assign to Box 1
-
-                obj_mask[b, gy, gx, box_idx] = True
-                target_conf[b, gy, gx, box_idx] = 1.0
-                target_coord[b, gy, gx, box_idx] = torch.tensor(
-                    [tx, ty, w, h], dtype=torch.float32, device=device
-                )
-
-                target_class[b, gy, gx] = label
-                class_mask[b, gy, gx] = True
-
-        # ------------------------------------------------------------------
-        # B. Slice and Transform Model Predictions
-        # ------------------------------------------------------------------
-        pred_boxes = []
-        pred_confs = []
+        pred_boxes_list = []
+        pred_confs_list = []
 
         for b in range(self.num_boxes):
             start = b * 5
@@ -150,34 +126,84 @@ class YOLOLoss(nn.Module):
             th = torch.sigmoid(predictions[..., start + 3])
             tconf_logit = predictions[..., start + 4]  # Keep raw logit for BCEWithLogits
 
-            pred_boxes.append(torch.stack([tx, ty, tw, th], dim=-1))
-            pred_confs.append(tconf_logit)
+            # Decode center relative to grid cell and convert [cx, cy, w, h] -> [x1, y1, x2, y2]
+            cx = (tx + grid_x) / float(grid_w)
+            cy = (ty + grid_y) / float(grid_h)
+            box_xyxy = torch.stack(
+                [cx - 0.5 * tw, cy - 0.5 * th, cx + 0.5 * tw, cy + 0.5 * th],
+                dim=-1,
+            )
 
-        pred_boxes = torch.stack(pred_boxes, dim=3)  # (B, S, S, num_boxes, 4)
-        pred_confs = torch.stack(pred_confs, dim=3)  # (B, S, S, num_boxes) logits
+            pred_boxes_list.append(box_xyxy)
+            pred_confs_list.append(tconf_logit)
+
+        pred_boxes_xyxy = torch.stack(pred_boxes_list, dim=3)  # (B, S, S, num_boxes, 4)
+        pred_confs = torch.stack(pred_confs_list, dim=3)       # (B, S, S, num_boxes) logits
         pred_class_logits = predictions[..., self.num_boxes * 5 :]  # (B, S, S, num_classes)
+
+        # ------------------------------------------------------------------
+        # B. Dynamic IoU-Based Box Matching & Target Construction
+        # ------------------------------------------------------------------
+        target_boxes_xyxy = torch.zeros(batch_size, S, S, self.num_boxes, 4, device=device)
+        target_conf = torch.zeros(batch_size, S, S, self.num_boxes, device=device)
+        obj_mask = torch.zeros(batch_size, S, S, self.num_boxes, dtype=torch.bool, device=device)
+
+        target_class = torch.zeros(batch_size, S, S, dtype=torch.int64, device=device)
+        class_mask = torch.zeros(batch_size, S, S, dtype=torch.bool, device=device)
+
+        pred_boxes_detached = pred_boxes_xyxy.detach()
+
+        for b in range(batch_size):
+            gt_boxes = targets[b]["boxes_xywh"]  # [N, 4]: cx, cy, w, h in [0, 1]
+            gt_labels = targets[b]["labels"]     # [N]
+
+            for idx in range(len(gt_boxes)):
+                cx, cy, w, h = gt_boxes[idx].tolist()
+                label = int(gt_labels[idx].item())
+
+                # Determine which grid cell (gy, gx) contains the object center
+                gx = min(int(cx * grid_w), grid_w - 1)
+                gy = min(int(cy * grid_h), grid_h - 1)
+
+                target_class[b, gy, gx] = label
+                class_mask[b, gy, gx] = True
+
+                # Match to the unassigned predictor in (gy, gx) with highest IoU
+                available = ~obj_mask[b, gy, gx]
+                if not available.any():
+                    continue
+
+                gt_xyxy = torch.tensor(
+                    [[cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h]],
+                    dtype=predictions.dtype,
+                    device=device,
+                )
+                ious = box_iou(pred_boxes_detached[b, gy, gx], gt_xyxy).squeeze(1)
+                best_box_idx = int(ious.masked_fill(~available, -1.0).argmax().item())
+                best_iou = float(ious[best_box_idx].clamp(0.0, 1.0).item())
+
+                obj_mask[b, gy, gx, best_box_idx] = True
+                target_boxes_xyxy[b, gy, gx, best_box_idx] = gt_xyxy[0]
+                target_conf[b, gy, gx, best_box_idx] = (
+                    (1.0 - self.iou_target_weight) + self.iou_target_weight * best_iou
+                )
 
         # ------------------------------------------------------------------
         # C. Compute Individual Loss Terms
         # ------------------------------------------------------------------
         num_objects = obj_mask.sum().clamp(min=1).item()
 
-        # 1. Coordinate Loss: MSE on (tx, ty) and square-root (w, h)
+        # 1. Coordinate Loss: Complete IoU (CIoU) on responsible boxes
         if obj_mask.any():
-            loss_xy = F.mse_loss(
-                pred_boxes[..., :2][obj_mask], target_coord[..., :2][obj_mask], reduction="sum"
+            loss_coord = ops.complete_box_iou_loss(
+                pred_boxes_xyxy[obj_mask],
+                target_boxes_xyxy[obj_mask],
+                reduction="mean",
             )
-            # Sqrt on w, h ensures smaller deviations in small boxes are penalized appropriately
-            loss_wh = F.mse_loss(
-                torch.sqrt(pred_boxes[..., 2:][obj_mask] + 1e-6),
-                torch.sqrt(target_coord[..., 2:][obj_mask] + 1e-6),
-                reduction="sum",
-            )
-            loss_coord = (loss_xy + loss_wh) / num_objects
         else:
             loss_coord = torch.tensor(0.0, device=device)
 
-        # 2. Foreground Objectness Confidence Loss
+        # 2. Foreground Objectness Confidence Loss (IoU-aware target)
         if obj_mask.any():
             loss_obj = F.binary_cross_entropy_with_logits(
                 pred_confs[obj_mask], target_conf[obj_mask], reduction="sum"
@@ -335,8 +361,8 @@ def test_model(
     dataloader: DataLoader,
     criterion: YOLOLoss,
     device: torch.device,
-    conf_threshold: float = 0.25,
-    iou_threshold: float = 0.45,
+    conf_threshold: float = 0.50,
+    iou_threshold: float = 0.30,
 ) -> Dict[str, float]:
     """
     Evaluates the model on the held-out test split, reporting loss
@@ -387,26 +413,104 @@ def test_model(
 # 5. Overarching Training Pipeline Orchestrator
 # ==============================================================================
 
+def build_optimizer(
+    model: BCCDYOLO,
+    head_lr: float,
+    backbone_lr: float,
+    weight_decay: float,
+) -> torch.optim.AdamW:
+    """
+    Creates an AdamW optimizer with differential learning rates:
+    pretrained backbone parameters use backbone_lr (lower), while the
+    randomly initialized YOLO head uses head_lr (higher).
+    """
+    param_groups = []
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    head_params = [p for p in model.head.parameters() if p.requires_grad]
+
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": backbone_lr, "name": "backbone"})
+    if head_params:
+        param_groups.append({"params": head_params, "lr": head_lr, "name": "head"})
+
+    if not param_groups:
+        raise RuntimeError("No trainable parameters found when building optimizer.")
+
+    return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
+
+def format_lr_status(optimizer: torch.optim.Optimizer) -> str:
+    """Formats per-group learning rates for epoch logging."""
+    lrs = {g.get("name", f"group{i}"): g["lr"] for i, g in enumerate(optimizer.param_groups)}
+    head_str = f"Head LR: {lrs['head']:.2e}" if "head" in lrs else "Head: frozen"
+    bb_str = f"Backbone LR: {lrs['backbone']:.2e}" if "backbone" in lrs else "Backbone: frozen"
+    return f"{head_str} | {bb_str}"
+
+
+def log_trainable_params(model: BCCDYOLO, stage_label: str) -> None:
+    """Logs trainable parameter counts across backbone and detection head."""
+    bb_trainable = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
+    bb_total = sum(p.numel() for p in model.backbone.parameters())
+    hd_trainable = sum(p.numel() for p in model.head.parameters() if p.requires_grad)
+    hd_total = sum(p.numel() for p in model.head.parameters())
+    print(
+        f"[{stage_label}] Trainable Params -> "
+        f"Backbone: {bb_trainable:,}/{bb_total:,} (freeze_stages={model.backbone.freeze_stages}) | "
+        f"Head: {hd_trainable:,}/{hd_total:,}"
+    )
+
+
+def save_checkpoint(
+    path: str,
+    epoch: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    val_loss: float,
+    best_val_loss: float,
+) -> None:
+    """Saves model weights, optimizer state, and validation tracking metrics."""
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_loss": val_loss,
+            "best_val_loss": best_val_loss,
+        },
+        path,
+    )
+
+
 def run_pipeline(
     data_dir: str = "/home/albert/data/bccd",
     epochs: int = 20,
     batch_size: int = 8,
-    lr: float = 1e-4,
+    lr: float = 1e-3,
+    backbone_lr: float = 1e-5,
     weight_decay: float = 1e-4,
     img_size: int = 448,
-    freeze_stages: int = 0,
-    lambda_noobj: float = 2.0,
+    freeze_stages: int = 2,
+    warmup_epochs: Optional[int] = None,
+    lambda_noobj: float = 5.0,
     augment: bool = True,
     save_dir: str = "./checkpoints",
     device_str: str = "auto",
     test_only: bool = False,
     weights_path: Optional[str] = None,
+    resume_path: Optional[str] = None,
 ):
     # Device configuration
     if device_str == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(device_str)
+
+    if warmup_epochs is None:
+        warmup_epochs = 0 if resume_path else 5
+
+    effective_warmup = max(0, min(warmup_epochs, epochs))
+    use_two_stage = (effective_warmup > 0) and (effective_warmup < epochs) and (freeze_stages < 4)
+    initial_freeze_stages = 4 if effective_warmup > 0 else freeze_stages
 
     print("=" * 70)
     print("=== BCCD YOLO Detector Pipeline ===")
@@ -418,7 +522,9 @@ def run_pipeline(
     print(f"Image Resolution: {img_size} x {img_size}")
     print(f"Batch Size:       {batch_size}")
     print(f"Epochs:           {epochs}")
-    print(f"Initial LR:       {lr}")
+    print(f"Head LR:          {lr}")
+    print(f"Backbone LR:      {backbone_lr}")
+    print(f"Freeze Stages:    {freeze_stages} (Warmup epochs @ freeze=4: {effective_warmup})")
     print(f"Lambda No-Object: {lambda_noobj}")
     print(f"Augmentation:     {'Enabled (Flips, 90-deg Rotations, ColorJitter)' if augment else 'Disabled'}")
 
@@ -440,7 +546,7 @@ def run_pipeline(
         num_classes=3,
         num_boxes=2,
         pretrained_backbone=True,
-        freeze_stages=freeze_stages,
+        freeze_stages=initial_freeze_stages,
     ).to(device)
 
     criterion = YOLOLoss(num_classes=3, num_boxes=2, lambda_noobj=lambda_noobj)
@@ -456,26 +562,61 @@ def run_pipeline(
         test_model(model, test_loader, criterion, device)
         return
 
-    # Optimizer & LR Scheduler
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-
-    # Checkpoint directory
     os.makedirs(save_dir, exist_ok=True)
     best_val_loss = float("inf")
     best_epoch = 0
 
+    # Optional resume from prior checkpoint (e.g. manual Stage 2 fine-tuning)
+    if resume_path is not None:
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"Resume checkpoint not found at: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        best_val_loss = checkpoint.get("best_val_loss", checkpoint.get("val_loss", float("inf")))
+        print(
+            f"Resumed weights from: {resume_path} "
+            f"(ckpt epoch: {checkpoint.get('epoch', '?')}, best_val_loss: {best_val_loss:.4f})"
+        )
+
+    # Initial Optimizer & LR Scheduler (Stage 1 Warmup or Single-Stage Fine-Tuning)
+    optimizer = build_optimizer(model, head_lr=lr, backbone_lr=backbone_lr, weight_decay=weight_decay)
+    if use_two_stage:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=effective_warmup, eta_min=max(lr * 0.1, 1e-6)
+        )
+        initial_stage_label = f"Stage 1 Warmup (Epochs 1-{effective_warmup})"
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+        initial_stage_label = (
+            "Stage 1 Only (Head Warmup)" if initial_freeze_stages == 4 else "Fine-Tuning"
+        )
+
     print("\n" + "=" * 70)
     print("=== Commencing Model Training ===")
     print("=" * 70)
+    log_trainable_params(model, initial_stage_label)
 
     for epoch in range(1, epochs + 1):
+        # Transition from Stage 1 (frozen backbone warmup) to Stage 2 (unfrozen differential LR)
+        if use_two_stage and epoch == effective_warmup + 1:
+            stage2_epochs = epochs - effective_warmup
+            print("\n" + "-" * 70)
+            print(
+                f"=== Stage 2 Fine-Tuning (Epochs {epoch}-{epochs}): "
+                f"Unfreezing backbone to freeze_stages={freeze_stages} ==="
+            )
+            print("-" * 70)
+            model.set_freeze_stages(freeze_stages)
+            log_trainable_params(model, f"Stage 2 Fine-Tuning (Epochs {epoch}-{epochs})")
+            optimizer = build_optimizer(
+                model, head_lr=lr, backbone_lr=backbone_lr, weight_decay=weight_decay
+            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=stage2_epochs, eta_min=1e-6
+            )
+
         epoch_start = time.perf_counter()
-        print(f"\nEpoch [{epoch:2d}/{epochs:2d}] (LR: {scheduler.get_last_lr()[0]:.2e})")
+        print(f"\nEpoch [{epoch:2d}/{epochs:2d}] ({format_lr_status(optimizer)})")
 
         # 1. Train
         train_res = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
@@ -493,33 +634,16 @@ def run_pipeline(
         )
 
         # 3. Checkpoint Saving (Best Model)
-        is_best = val_res["loss"] < best_val_loss
-        if is_best:
+        if val_res["loss"] < best_val_loss:
             best_val_loss = val_res["loss"]
             best_epoch = epoch
             best_path = os.path.join(save_dir, "best_model.pth")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": val_res["loss"],
-                },
-                best_path,
-            )
+            save_checkpoint(best_path, epoch, model, optimizer, val_res["loss"], best_val_loss)
             print(f"  *** Best model saved to {best_path} (Val Loss: {best_val_loss:.4f}) ***")
 
         # Always save latest checkpoint
         last_path = os.path.join(save_dir, "last_model.pth")
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_res["loss"],
-            },
-            last_path,
-        )
+        save_checkpoint(last_path, epoch, model, optimizer, val_res["loss"], best_val_loss)
 
     print("\n" + "=" * 70)
     print(f"Training Complete! Best Epoch: {best_epoch} (Val Loss: {best_val_loss:.4f})")
@@ -544,16 +668,19 @@ def parse_args():
     parser.add_argument("--data-dir", type=str, default="/home/albert/data/bccd", help="Dataset root directory")
     parser.add_argument("--epochs", type=int, default=20, help="Total training epochs")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for DataLoaders")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Initial learning rate")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate for detection head (default: 1e-3)")
+    parser.add_argument("--backbone-lr", type=float, default=1e-5, help="Initial learning rate for pretrained backbone (default: 1e-5)")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay")
     parser.add_argument("--img-size", type=int, default=448, help="Square input image dimension")
-    parser.add_argument("--freeze-stages", type=int, default=0, help="Backbone stages to freeze (0 to 4)")
-    parser.add_argument("--lambda-noobj", type=float, default=2.0, help="Weight for background / no-object loss (default: 2.0)")
+    parser.add_argument("--freeze-stages", type=int, default=2, help="Backbone stages kept frozen during fine-tuning, 0 to 4 (default: 2)")
+    parser.add_argument("--warmup-epochs", type=int, default=None, help="Stage 1 head-only warmup epochs with freeze_stages=4 (default: 5, or 0 with --resume)")
+    parser.add_argument("--lambda-noobj", type=float, default=5.0, help="Weight for background / no-object loss (default: 5.0)")
     parser.add_argument("--no-augment", action="store_true", help="Disable data augmentation during training")
     parser.add_argument("--save-dir", type=str, default="./checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--device", type=str, default="auto", help="'cuda', 'cpu', or 'auto'")
     parser.add_argument("--test-only", action="store_true", help="Skip training and run evaluation on test set")
     parser.add_argument("--weights", type=str, default=None, help="Path to weights file for testing")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (.pth) to resume training from")
     return parser.parse_args()
 
 
@@ -564,14 +691,17 @@ if __name__ == "__main__":
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        backbone_lr=args.backbone_lr,
         weight_decay=args.weight_decay,
         img_size=args.img_size,
         freeze_stages=args.freeze_stages,
+        warmup_epochs=args.warmup_epochs,
         lambda_noobj=args.lambda_noobj,
         augment=not args.no_augment,
         save_dir=args.save_dir,
         device_str=args.device,
         test_only=args.test_only,
         weights_path=args.weights,
+        resume_path=args.resume,
     )
 
